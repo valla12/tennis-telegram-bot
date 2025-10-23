@@ -11,8 +11,8 @@ TELEGRAM_TOKEN = "8364164697:AAE0c8ANNW9o4E6Ia37yuPpj87CnY8xr79Y"
 DEFAULT_TZ = "Asia/Kolkata"
 
 # 🔔 set your reminder time here (24h format, IST)
-REMINDER_HOUR = 18
-REMINDER_MIN  = 41
+REMINDER_HOUR = 10
+REMINDER_MIN  = 10
 
 # who will receive reminders (anyone who typed /start in this run)
 subscribed_users = set()
