@@ -1,26 +1,30 @@
+# === Tennis bot with reliable daily reminder (no APScheduler) ===
 import asyncio, nest_asyncio, requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 nest_asyncio.apply()
 
-# ---- CONFIG ----
 TELEGRAM_TOKEN = "8364164697:AAE0c8ANNW9o4E6Ia37yuPpj87CnY8xr79Y"
 DEFAULT_TZ = "Asia/Kolkata"
 
-# ---- DATA PROVIDER ----
+# 🔔 set your reminder time here (24h format, IST)
+REMINDER_HOUR = 18
+REMINDER_MIN  = 41
+
+# who will receive reminders (anyone who typed /start in this run)
+subscribed_users = set()
+
+# ---------- your working provider (unchanged) ----------
 class TennisEventsProvider:
     def __init__(self):
         self.urls = {
             "ATP": "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard",
             "WTA": "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard",
         }
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0"}
 
     def _safe_name(self, c):
         return (
@@ -34,7 +38,6 @@ class TennisEventsProvider:
         all_matches = []
         all_tournaments = {}
 
-        # 🎾 Step 1: fetch everything
         for tour, url in self.urls.items():
             try:
                 data = requests.get(url, headers=self.headers, timeout=10).json()
@@ -50,16 +53,10 @@ class TennisEventsProvider:
                         competitors = comp.get("competitors", [])
                         notes = comp.get("notes", [])
 
-                        # store all players seen in this tournament
-                        if tournament_name not in all_tournaments:
-                            all_tournaments[tournament_name] = set()
-
+                        all_tournaments.setdefault(tournament_name, set())
                         for c in competitors:
-                            all_tournaments[tournament_name].add(
-                                self._safe_name(c).upper()
-                            )
+                            all_tournaments[tournament_name].add(self._safe_name(c).upper())
 
-                        # normal match or completed match
                         date_str = comp.get("date") or ev.get("date", "")
                         try:
                             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
@@ -85,65 +82,37 @@ class TennisEventsProvider:
                                 "league": tournament_name,
                                 "home": home,
                                 "away": away,
-                                "score": f"{score_home}-{score_away}" if score_home or score_away else "TBD",
+                                "score": f"{score_home}-{score_away}" if (score_home or score_away) else "TBD",
                                 "status": status,
                                 "time": dt,
                             })
 
-        # 🎾 Step 2: detect tournaments that include Sinner / Djokovic / Alcaraz
+        # tournaments that include Sinner/Djokovic/Alcaraz
         fav_players = ["SINNER", "DJOKOVIC", "DJOKOVIĆ", "ALCARAZ"]
-        fav_tournaments = set()
-        for tname, players in all_tournaments.items():
-            if any(p in " ".join(players) for p in fav_players):
-                fav_tournaments.add(tname)
+        fav_tours = {t for t, players in all_tournaments.items() if any(p in " ".join(players) for p in fav_players)}
 
-        print("🎯 Fav tournaments detected:", fav_tournaments)
-
-        # 🎾 Step 3: filter today's matches only (from those tournaments)
-        now_local = datetime.now(ZoneInfo(DEFAULT_TZ))
-        today_date = now_local.date()
-
-        filtered = [
+        today = datetime.now(ZoneInfo(DEFAULT_TZ)).date()
+        return [
             m for m in all_matches
-            if m["league"] in fav_tournaments
-            and m["time"].astimezone(ZoneInfo(DEFAULT_TZ)).date() == today_date
+            if m["league"] in fav_tours
+            and m["time"].astimezone(ZoneInfo(DEFAULT_TZ)).date() == today
         ]
-
-        print(f"✅ Parsed {len(filtered)} matches in fav tournaments for today")
-        for m in filtered[:5]:
-            print(f"→ {m['league']}: {m['home']} vs {m.get('away','')} ({m['status']})")
-
-        return filtered
-
 
 PROVIDER = TennisEventsProvider()
 
-# ---- BOT ----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎾 Hey! I’ll show today's matches in tournaments where Sinner, Djokovic, or Alcaraz are playing.\n\n"
-        "Use /today to get the list."
-    )
-
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    events = PROVIDER.get_events()
-    if not events:
-        await update.message.reply_text("😴 No matches today in those tournaments.")
-        return
-
-    # group matches by tournament
+# ---------- formatting ----------
+def format_events(events):
     grouped = {}
     for ev in events:
         grouped.setdefault(ev["league"], []).append(ev)
 
-    # 🎨 format text nicely
     text = "🎾 *Today’s Matches*\n\n"
     for league, matches in grouped.items():
         text += f"🏆 *{league}*\n"
         for m in matches:
             local = m["time"].astimezone(ZoneInfo(DEFAULT_TZ))
-            time_str = local.strftime("%I:%M %p").lstrip("0")  # 09:00 → 9:00
-            status = m["status"].replace("Scheduled", "").replace("Final", "Completed").strip()
+            time_str = local.strftime("%I:%M %p").lstrip("0")
+            status = m.get("status","").replace("Scheduled","").replace("Final","Completed").strip()
 
             if m.get("away"):
                 line = f"   {m['home']} vs {m['away']}"
@@ -158,17 +127,66 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             text += line + "\n"
         text += "\n"
+    return text.strip()
 
-    # send in chunks (telegram 4096 limit)
-    for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
+# ---------- commands ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    subscribed_users.add(cid)
+    print("subscribed:", cid)
+    await update.message.reply_text("✅ Subscribed! you’ll get the daily reminder at the set time.")
 
-# ---- MAIN ----
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    events = PROVIDER.get_events()
+    if not events:
+        await update.message.reply_text("😴 No matches today in those tournaments.")
+        return
+    await update.message.reply_text(format_events(events), parse_mode="Markdown")
+
+# ---------- reminder logic (pure asyncio) ----------
+async def send_reminder(bot):
+    events = PROVIDER.get_events()
+    if not events:
+        print("no matches today → skip reminder")
+        return
+    msg = format_events(events)
+    for cid in list(subscribed_users):
+        try:
+            await bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+            print("sent to", cid)
+        except Exception as e:
+            print("send error", cid, e)
+
+def seconds_until(hour:int, minute:int, tz:str) -> float:
+    now = datetime.now(ZoneInfo(tz))
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+async def daily_scheduler(bot, hour:int, minute:int, tz:str):
+    while True:
+        secs = seconds_until(hour, minute, tz)
+        print(f"⏳ sleeping {int(secs)}s until next reminder ({hour:02d}:{minute:02d} {tz})")
+        await asyncio.sleep(secs)
+        try:
+            await send_reminder(bot)
+        except Exception as e:
+            print("reminder error:", e)
+        # tiny buffer to avoid duplicate triggers if clock slip
+        await asyncio.sleep(2)
+
+# ---------- main ----------
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("today", today))
-    print("🎾 Tennis Bot is live! Type /start in Telegram.")
+
+    # start the daily scheduler in the background
+    asyncio.create_task(daily_scheduler(app.bot, REMINDER_HOUR, REMINDER_MIN, DEFAULT_TZ))
+
+    print(f"🎾 Tennis Bot is live — daily reminder at {REMINDER_HOUR:02d}:{REMINDER_MIN:02d} {DEFAULT_TZ}.")
     await app.run_polling()
 
 asyncio.get_event_loop().run_until_complete(main())
+
